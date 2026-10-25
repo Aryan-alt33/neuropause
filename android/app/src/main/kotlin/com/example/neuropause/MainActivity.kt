@@ -56,10 +56,16 @@ class MainActivity : FlutterActivity() {
                             events?.success(item)
                         }
                     }
+                    NeuroNotificationListenerService.onNotificationRemovedCallback = { item ->
+                        runOnUiThread {
+                            events?.success(item)
+                        }
+                    }
                 }
 
                 override fun onCancel(arguments: Any?) {
                     NeuroNotificationListenerService.onNotificationReceived = null
+                    NeuroNotificationListenerService.onNotificationRemovedCallback = null
                 }
             }
         )

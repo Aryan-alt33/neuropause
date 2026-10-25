@@ -1,40 +1,179 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'app_theme.dart';
 import 'services/android_notification_service.dart';
 
 enum NotificationPriority {
-  urgent,
-  important,
-  canWait,
+  critical, // P1: deliver immediately and bypass batching
+  high,     // P2: deliver after a short configurable delay
+  normal,   // P3: deliver in the regular scheduled batch
+  low,      // P4: hold until the next break or scheduled review
+}
+
+extension NotificationPriorityExt on NotificationPriority {
+  String get code {
+    switch (this) {
+      case NotificationPriority.critical:
+        return 'P1';
+      case NotificationPriority.high:
+        return 'P2';
+      case NotificationPriority.normal:
+        return 'P3';
+      case NotificationPriority.low:
+        return 'P4';
+    }
+  }
+
+  String get label {
+    switch (this) {
+      case NotificationPriority.critical:
+        return 'P1 Critical';
+      case NotificationPriority.high:
+        return 'P2 High';
+      case NotificationPriority.normal:
+        return 'P3 Normal';
+      case NotificationPriority.low:
+        return 'P4 Low';
+    }
+  }
+
+  String get shortTitle {
+    switch (this) {
+      case NotificationPriority.critical:
+        return 'Critical';
+      case NotificationPriority.high:
+        return 'High';
+      case NotificationPriority.normal:
+        return 'Normal';
+      case NotificationPriority.low:
+        return 'Low';
+    }
+  }
+
+  String get description {
+    switch (this) {
+      case NotificationPriority.critical:
+        return 'Immediate bypass • Delivers without pause delay';
+      case NotificationPriority.high:
+        return 'Short delay batch • Fast-tracked review';
+      case NotificationPriority.normal:
+        return 'Regular scheduled batch • Paused for focus';
+      case NotificationPriority.low:
+        return 'Held for mindful break or evening review';
+    }
+  }
+
+  Color get color {
+    switch (this) {
+      case NotificationPriority.critical:
+        return const Color(0xFFDC2626); // Red
+      case NotificationPriority.high:
+        return const Color(0xFFD97706); // Amber
+      case NotificationPriority.normal:
+        return const Color(0xFF2E7D32); // Sage / Forest Green
+      case NotificationPriority.low:
+        return const Color(0xFF5A6E63); // Muted Slate
+    }
+  }
+
+  Color get bgColor {
+    switch (this) {
+      case NotificationPriority.critical:
+        return const Color(0xFFFFF1F1);
+      case NotificationPriority.high:
+        return const Color(0xFFFFFBEB);
+      case NotificationPriority.normal:
+        return const Color(0xFFF0FDF4);
+      case NotificationPriority.low:
+        return const Color(0xFFF1F5F3);
+    }
+  }
+
+  Color get borderColor {
+    switch (this) {
+      case NotificationPriority.critical:
+        return const Color(0xFFFECACA);
+      case NotificationPriority.high:
+        return const Color(0xFFFDE68A);
+      case NotificationPriority.normal:
+        return const Color(0xFFBBF7D0);
+      case NotificationPriority.low:
+        return const Color(0xFFD5DFD9);
+    }
+  }
+
+  IconData get icon {
+    switch (this) {
+      case NotificationPriority.critical:
+        return Icons.emergency_rounded;
+      case NotificationPriority.high:
+        return Icons.priority_high_rounded;
+      case NotificationPriority.normal:
+        return Icons.schedule_rounded;
+      case NotificationPriority.low:
+        return Icons.spa_outlined;
+    }
+  }
 }
 
 class PauseNotificationItem {
   final String id;
+  final String packageName;
   final String sender;
   final String appName;
   final IconData appIcon;
   final String title;
   final String message;
+  final int postTime;
   final String timestamp;
-  final NotificationPriority priority;
-  final String policyLabel;
+  NotificationPriority priority;
+  final String nativeImportance;
+  final String nativeChannelId;
   bool isDelivered;
   bool isDismissed;
 
   PauseNotificationItem({
     required this.id,
+    required this.packageName,
     required this.sender,
     required this.appName,
     required this.appIcon,
     required this.title,
     required this.message,
+    required this.postTime,
     required this.timestamp,
     required this.priority,
-    required this.policyLabel,
+    required this.nativeImportance,
+    this.nativeChannelId = '',
     this.isDelivered = false,
     this.isDismissed = false,
   });
+
+  String getPolicyLabel(int p2DelayMinutes) {
+    if (isDelivered) {
+      return 'Delivered • Ready in your notifications';
+    }
+    switch (priority) {
+      case NotificationPriority.critical:
+        return 'Allowed Through • Sound & Alert ON';
+      case NotificationPriority.high:
+        final age = DateTime.now()
+            .difference(DateTime.fromMillisecondsSinceEpoch(postTime))
+            .inMinutes;
+        final remaining = p2DelayMinutes - age;
+        if (remaining > 0) {
+          return 'Batched • Delivers in ${remaining}m (Short Delay)';
+        } else {
+          return 'Ready for delivery • Short Delay elapsed';
+        }
+      case NotificationPriority.normal:
+        return 'Batched for Break • Scheduled Pause Release';
+      case NotificationPriority.low:
+        return 'Silenced • Kept for Evening / Break Review';
+    }
+  }
 }
 
 class NotificationPauseScreen extends StatefulWidget {
@@ -48,13 +187,22 @@ class NotificationPauseScreen extends StatefulWidget {
 
 class _NotificationPauseScreenState extends State<NotificationPauseScreen>
     with WidgetsBindingObserver {
+  static const String _prefPrioritiesKey = 'neuropause_priority_overrides_v2';
+  static const String _prefDismissedKey = 'neuropause_dismissed_ids_v2';
+  static const String _prefP2DelayKey = 'neuropause_p2_delay_minutes';
+
   bool _isPauseActive = true;
   String _selectedFilter = 'All';
   String _selectedDuration = '1 hour';
 
+  int _p2DelayMinutes = 5; // Default short delay for P2 High
+
   bool _hasPermission = false;
   bool _isDemoMode = false;
   bool _isLoading = false;
+
+  Map<String, String> _persistedPriorities = {};
+  Set<String> _dismissedIds = {};
 
   List<PauseNotificationItem> _notifications = [];
   List<PauseNotificationItem> _sampleNotifications = [];
@@ -66,7 +214,9 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _initSampleNotifications();
-    _checkPermissionAndRefresh();
+    _loadPreferences().then((_) {
+      _checkPermissionAndRefresh();
+    });
     _listenToLiveNotifications();
   }
 
@@ -84,43 +234,98 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
     }
   }
 
+  Future<void> _loadPreferences() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      _p2DelayMinutes = prefs.getInt(_prefP2DelayKey) ?? 5;
+
+      final rawPriorities = prefs.getString(_prefPrioritiesKey);
+      if (rawPriorities != null && rawPriorities.isNotEmpty) {
+        final decoded = jsonDecode(rawPriorities);
+        if (decoded is Map) {
+          _persistedPriorities = Map<String, String>.from(decoded);
+        }
+      }
+
+      final rawDismissed = prefs.getStringList(_prefDismissedKey);
+      if (rawDismissed != null) {
+        _dismissedIds = Set<String>.from(rawDismissed);
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _savePreferences() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt(_prefP2DelayKey, _p2DelayMinutes);
+      await prefs.setString(
+          _prefPrioritiesKey, jsonEncode(_persistedPriorities));
+      await prefs.setStringList(
+          _prefDismissedKey, _dismissedIds.toList());
+    } catch (_) {}
+  }
+
   void _initSampleNotifications() {
     _sampleNotifications = [
       PauseNotificationItem(
-        id: '1',
+        id: 'sample_p1_1',
+        packageName: 'com.healthcare.emergency',
         sender: 'Dr. Elena Vance (Family Clinic)',
         appName: 'Health & Care',
         appIcon: Icons.local_hospital_rounded,
         title: 'Appointment Confirmation Needed',
         message:
             'Please confirm your lab review scheduled for tomorrow at 9:30 AM.',
+        postTime: DateTime.now().subtract(const Duration(minutes: 2)).millisecondsSinceEpoch,
         timestamp: '2m ago',
-        priority: NotificationPriority.urgent,
-        policyLabel: 'Allowed Through • Sound & Alert ON',
+        priority: NotificationPriority.critical,
+        nativeImportance: 'High',
+        isDelivered: true,
       ),
       PauseNotificationItem(
-        id: '2',
+        id: 'sample_p2_1',
+        packageName: 'com.whatsapp',
         sender: 'Sarah Jenkins (Project Lead)',
-        appName: 'Work Slack',
-        appIcon: Icons.work_outline_rounded,
-        title: 'Quarterly Review Deck',
+        appName: 'WhatsApp',
+        appIcon: Icons.chat_bubble_outline_rounded,
+        title: 'Quarterly Review Sync',
         message:
-            'Could you review slides 4-8 before our 3:30 PM client strategy sync?',
-        timestamp: '18m ago',
-        priority: NotificationPriority.important,
-        policyLabel: 'Batched for Break • Next batch in 42m',
+            'Could you review slides 4-8 before our strategy call in 15m?',
+        postTime: DateTime.now().subtract(const Duration(minutes: 6)).millisecondsSinceEpoch,
+        timestamp: '6m ago',
+        priority: NotificationPriority.high,
+        nativeImportance: 'High',
+        isDelivered: false,
       ),
       PauseNotificationItem(
-        id: '3',
-        sender: 'Mindful Reads Digest',
-        appName: 'Newsletter',
-        appIcon: Icons.menu_book_rounded,
-        title: 'Weekly Mindfulness Digest',
+        id: 'sample_p3_1',
+        packageName: 'com.slack',
+        sender: 'Work Workspace #team-dev',
+        appName: 'Slack',
+        appIcon: Icons.work_outline_rounded,
+        title: 'Sprint Planning Updates',
         message:
-            '5 research-backed strategies to declutter your evening digital habits.',
+            'Sprint 14 backlog refinement is finalized. Please review Jira tickets.',
+        postTime: DateTime.now().subtract(const Duration(minutes: 25)).millisecondsSinceEpoch,
+        timestamp: '25m ago',
+        priority: NotificationPriority.normal,
+        nativeImportance: 'Default',
+        isDelivered: false,
+      ),
+      PauseNotificationItem(
+        id: 'sample_p4_1',
+        packageName: 'com.medium.reader',
+        sender: 'Mindful Reads Weekly Digest',
+        appName: 'Medium',
+        appIcon: Icons.menu_book_rounded,
+        title: 'Declutter Your Evening Digital Habits',
+        message:
+            '5 research-backed strategies to reduce stress before bedtime.',
+        postTime: DateTime.now().subtract(const Duration(hours: 1)).millisecondsSinceEpoch,
         timestamp: '1h ago',
-        priority: NotificationPriority.canWait,
-        policyLabel: 'Silenced • Kept in Evening Digest',
+        priority: NotificationPriority.low,
+        nativeImportance: 'Low',
+        isDelivered: false,
       ),
     ];
     _notifications = List.from(_sampleNotifications);
@@ -151,9 +356,15 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
       final rawList = await AndroidNotificationService.getNotifications();
       if (!mounted) return;
       if (rawList.isNotEmpty) {
-        final mapped = rawList.map(_mapNativeNotification).toList();
+        final List<PauseNotificationItem> updated = [];
+        for (final raw in rawList) {
+          final id = (raw['id'] as String?) ?? '';
+          if (_dismissedIds.contains(id)) continue;
+          final item = _mapNativeNotification(raw);
+          updated.add(item);
+        }
         setState(() {
-          _realNotifications = mapped;
+          _realNotifications = updated;
           if (!_isDemoMode) {
             _notifications = List.from(_realNotifications);
           }
@@ -178,19 +389,53 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
     _liveSubscription =
         AndroidNotificationService.onNotificationReceived.listen((raw) {
       if (!mounted) return;
+
+      final eventType = raw['eventType'] as String? ?? 'posted';
+      final id = (raw['id'] as String?) ?? '';
+
+      if (eventType == 'removed') {
+        setState(() {
+          _realNotifications.removeWhere((n) => n.id == id);
+          _notifications.removeWhere((n) => n.id == id);
+        });
+        return;
+      }
+
+      if (_dismissedIds.contains(id)) return;
+
       final item = _mapNativeNotification(raw);
       setState(() {
-        _realNotifications.removeWhere((n) => n.id == item.id);
-        _realNotifications.insert(0, item);
+        // Handle notification update in-place safely
+        final existingIndex = _realNotifications.indexWhere((n) => n.id == item.id);
+        if (existingIndex >= 0) {
+          final existing = _realNotifications[existingIndex];
+          // Preserve manual priority, isDelivered, isDismissed
+          item.priority = existing.priority;
+          item.isDelivered = existing.isDelivered;
+          item.isDismissed = existing.isDismissed;
+          _realNotifications[existingIndex] = item;
+        } else {
+          _realNotifications.insert(0, item);
+        }
+
         if (!_isDemoMode) {
-          _notifications.removeWhere((n) => n.id == item.id);
-          _notifications.insert(0, item);
+          final displayIndex = _notifications.indexWhere((n) => n.id == item.id);
+          if (displayIndex >= 0) {
+            final existing = _notifications[displayIndex];
+            item.priority = existing.priority;
+            item.isDelivered = existing.isDelivered;
+            item.isDismissed = existing.isDismissed;
+            _notifications[displayIndex] = item;
+          } else {
+            _notifications.insert(0, item);
+          }
         }
       });
     });
   }
 
   PauseNotificationItem _mapNativeNotification(Map<String, dynamic> raw) {
+    final id = (raw['id'] as String?) ?? UniqueKey().toString();
     final title = (raw['title'] as String?)?.trim() ?? '';
     final message = (raw['message'] as String?)?.trim() ?? '';
     final appName = (raw['appName'] as String?)?.trim() ?? 'App';
@@ -198,33 +443,25 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
     final postTime = raw['postTime'] is int
         ? raw['postTime'] as int
         : DateTime.now().millisecondsSinceEpoch;
+    final nativeImportance = (raw['nativeImportance'] as String?) ?? 'Default';
+    final nativeChannelId = (raw['nativeChannelId'] as String?) ?? '';
 
-    final combined = '$title $message'.toLowerCase();
+    final senderName = title.isNotEmpty ? title : appName;
+    final combined = '$title $message $appName'.toLowerCase();
+
+    // Check if user manually assigned priority previously for this stable ID or sender
     NotificationPriority priority;
-    String policyLabel;
+    final savedCode = _persistedPriorities[id] ??
+        _persistedPriorities['$pkg:$senderName'] ??
+        _persistedPriorities[pkg];
 
-    if (combined.contains('urgent') ||
-        combined.contains('emergency') ||
-        combined.contains('otp') ||
-        combined.contains('verification') ||
-        combined.contains('security alert') ||
-        combined.contains('code:')) {
-      priority = NotificationPriority.urgent;
-      policyLabel = 'Allowed Through • Sound & Alert ON';
-    } else if (pkg.contains('whatsapp') ||
-        pkg.contains('slack') ||
-        pkg.contains('teams') ||
-        pkg.contains('gm') ||
-        pkg.contains('mail') ||
-        pkg.contains('messaging') ||
-        pkg.contains('mms') ||
-        pkg.contains('discord') ||
-        pkg.contains('telegram')) {
-      priority = NotificationPriority.important;
-      policyLabel = 'Batched for Break • Next batch in 42m';
+    if (savedCode != null) {
+      priority = NotificationPriority.values.firstWhere(
+        (p) => p.name == savedCode,
+        orElse: () => _classifyDefault(combined, pkg),
+      );
     } else {
-      priority = NotificationPriority.canWait;
-      policyLabel = 'Silenced • Kept in Evening Digest';
+      priority = _classifyDefault(combined, pkg);
     }
 
     IconData icon;
@@ -258,97 +495,82 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
       timeStr = '${diff.inDays}d ago';
     }
 
+    // Critical notifications bypass batching immediately
+    final isDelivered = priority == NotificationPriority.critical;
+
     return PauseNotificationItem(
-      id: (raw['id'] as String?) ?? UniqueKey().toString(),
-      sender: title.isNotEmpty ? title : appName,
+      id: id,
+      packageName: pkg,
+      sender: senderName,
       appName: appName,
       appIcon: icon,
       title: title.isNotEmpty ? title : appName,
       message: message.isNotEmpty ? message : 'New notification',
+      postTime: postTime,
       timestamp: timeStr,
       priority: priority,
-      policyLabel: policyLabel,
+      nativeImportance: nativeImportance,
+      nativeChannelId: nativeChannelId,
+      isDelivered: isDelivered,
     );
   }
 
-  List<PauseNotificationItem> get _filteredNotifications {
-    final active = _notifications.where((n) => !n.isDismissed).toList();
-    if (_selectedFilter == 'Urgent') {
-      return active
-          .where((n) => n.priority == NotificationPriority.urgent)
-          .toList();
+  NotificationPriority _classifyDefault(String combined, String pkg) {
+    if (combined.contains('urgent') ||
+        combined.contains('emergency') ||
+        combined.contains('otp') ||
+        combined.contains('verification') ||
+        combined.contains('security alert') ||
+        combined.contains('code:')) {
+      return NotificationPriority.critical; // P1
+    } else if (pkg.contains('whatsapp') ||
+        pkg.contains('slack') ||
+        pkg.contains('teams') ||
+        pkg.contains('telegram') ||
+        pkg.contains('messaging')) {
+      return NotificationPriority.high; // P2 (communication)
+    } else if (pkg.contains('gm') ||
+        pkg.contains('mail') ||
+        pkg.contains('discord') ||
+        pkg.contains('work')) {
+      return NotificationPriority.normal; // P3 (work/mail batch)
+    } else {
+      return NotificationPriority.low; // P4 (digest/can wait)
     }
-    if (_selectedFilter == 'Important') {
-      return active
-          .where((n) => n.priority == NotificationPriority.important)
-          .toList();
-    }
-    if (_selectedFilter == 'Can Wait') {
-      return active
-          .where((n) => n.priority == NotificationPriority.canWait)
-          .toList();
-    }
-    return active;
   }
 
-  int _countForPriority(NotificationPriority priority) {
-    return _notifications
-        .where((n) => !n.isDismissed && n.priority == priority)
-        .length;
-  }
-
-  int get _batchedCount {
-    return _notifications
-        .where((n) =>
-            !n.isDismissed &&
-            !n.isDelivered &&
-            n.priority != NotificationPriority.urgent)
-        .length;
-  }
-
-  void _deliverAllBatched() {
+  void _updatePriority(PauseNotificationItem item, NotificationPriority newPriority) {
     setState(() {
-      for (final n in _notifications) {
-        if (!n.isDismissed && n.priority != NotificationPriority.urgent) {
-          n.isDelivered = true;
-        }
+      item.priority = newPriority;
+      if (newPriority == NotificationPriority.critical) {
+        item.isDelivered = true;
       }
     });
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: const Text(
-          'Delivered all batched notifications to your inbox.',
-          style: TextStyle(color: Colors.white),
-        ),
-        backgroundColor: AppColors.sagePrimary,
-        behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-      ),
-    );
-  }
-
-  void _dismissNotification(PauseNotificationItem item) {
-    setState(() {
-      item.isDismissed = true;
-    });
+    // Persist classification by stable ID and package/sender
+    _persistedPriorities[item.id] = newPriority.name;
+    _persistedPriorities['${item.packageName}:${item.sender}'] = newPriority.name;
+    _savePreferences();
 
     ScaffoldMessenger.of(context).hideCurrentSnackBar();
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text('Dismissed notification from ${item.sender}.'),
-        backgroundColor: AppColors.forestTextPrimary,
-        behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-        action: SnackBarAction(
-          label: 'Undo',
-          textColor: AppColors.paleMintSurface,
-          onPressed: () {
-            setState(() {
-              item.isDismissed = false;
-            });
-          },
+        content: Row(
+          children: [
+            Icon(newPriority.icon, color: Colors.white, size: 18),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                'Moved "${item.sender}" to ${newPriority.label}.',
+                style: const TextStyle(fontWeight: FontWeight.w600),
+              ),
+            ),
+          ],
         ),
+        backgroundColor: newPriority.color,
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 2),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       ),
     );
   }
@@ -368,8 +590,91 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
     );
   }
 
+  void _deliverSection(NotificationPriority priority) {
+    int count = 0;
+    setState(() {
+      for (final n in _notifications) {
+        if (!n.isDismissed && n.priority == priority && !n.isDelivered) {
+          n.isDelivered = true;
+          count++;
+        }
+      }
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('Delivered $count ${priority.label} notifications now.'),
+        backgroundColor: priority.color,
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+      ),
+    );
+  }
+
+  void _deliverAllBatched() {
+    int count = 0;
+    setState(() {
+      for (final n in _notifications) {
+        if (!n.isDismissed && !n.isDelivered && n.priority != NotificationPriority.critical) {
+          n.isDelivered = true;
+          count++;
+        }
+      }
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('Delivered $count batched notifications across all levels.'),
+        backgroundColor: AppColors.sagePrimary,
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+      ),
+    );
+  }
+
+  void _dismissNotification(PauseNotificationItem item) {
+    setState(() {
+      item.isDismissed = true;
+      _dismissedIds.add(item.id);
+    });
+    _savePreferences();
+
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('Dismissed notification from ${item.sender}.'),
+        backgroundColor: AppColors.forestTextPrimary,
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+        action: SnackBarAction(
+          label: 'Undo',
+          textColor: AppColors.paleMintSurface,
+          onPressed: () {
+            setState(() {
+              item.isDismissed = false;
+              _dismissedIds.remove(item.id);
+            });
+            _savePreferences();
+          },
+        ),
+      ),
+    );
+  }
+
+  List<PauseNotificationItem> get _activeNotifications =>
+      _notifications.where((n) => !n.isDismissed).toList();
+
+  List<PauseNotificationItem> _itemsForPriority(NotificationPriority p) =>
+      _activeNotifications.where((n) => n.priority == p).toList();
+
+  int get _batchedCount => _activeNotifications
+      .where((n) => !n.isDelivered && n.priority != NotificationPriority.critical)
+      .length;
+
   @override
   Widget build(BuildContext context) {
+    final activeCount = _activeNotifications.length;
+
     return Scaffold(
       backgroundColor: AppColors.paleMintBg,
       appBar: AppBar(
@@ -395,7 +700,7 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
           'Notification Pause',
           style: TextStyle(
             color: AppColors.forestTextPrimary,
-            fontSize: 20,
+            fontSize: 18,
             fontWeight: FontWeight.bold,
             letterSpacing: -0.3,
           ),
@@ -404,9 +709,7 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
           Container(
             margin: const EdgeInsets.symmetric(vertical: 10, horizontal: 4),
             decoration: BoxDecoration(
-              color: _isDemoMode
-                  ? const Color(0xFFF0F5F2)
-                  : AppColors.paleMintSurface,
+              color: _isDemoMode ? const Color(0xFFF0F5F2) : AppColors.paleMintSurface,
               borderRadius: BorderRadius.circular(20),
               border: Border.all(color: AppColors.borderSage),
             ),
@@ -428,7 +731,7 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
                 ScaffoldMessenger.of(context).showSnackBar(
                   SnackBar(
                     content: Text(_isDemoMode
-                        ? 'Showing Demo / Fallback notifications.'
+                        ? 'Showing Demo / Fallback 4-level notifications.'
                         : 'Switched to Live Real notifications.'),
                     duration: const Duration(seconds: 2),
                     behavior: SnackBarBehavior.floating,
@@ -436,27 +739,20 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
                 );
               },
               child: Padding(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     Icon(
-                      _isDemoMode
-                          ? Icons.play_arrow_outlined
-                          : Icons.sensors_rounded,
+                      _isDemoMode ? Icons.play_arrow_outlined : Icons.sensors_rounded,
                       size: 14,
-                      color: _isDemoMode
-                          ? AppColors.forestTextSecondary
-                          : AppColors.sagePrimary,
+                      color: _isDemoMode ? AppColors.forestTextSecondary : AppColors.sagePrimary,
                     ),
                     const SizedBox(width: 4),
                     Text(
                       _isDemoMode ? 'Demo' : 'Live',
                       style: TextStyle(
-                        color: _isDemoMode
-                            ? AppColors.forestTextSecondary
-                            : AppColors.sagePrimary,
+                        color: _isDemoMode ? AppColors.forestTextSecondary : AppColors.sagePrimary,
                         fontSize: 12,
                         fontWeight: FontWeight.bold,
                       ),
@@ -476,8 +772,7 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
                       color: AppColors.sagePrimary,
                     ),
                   )
-                : const Icon(Icons.refresh_rounded,
-                    color: AppColors.sagePrimary),
+                : const Icon(Icons.refresh_rounded, color: AppColors.sagePrimary),
             tooltip: 'Refresh Notifications',
             onPressed: () {
               if (_isDemoMode) {
@@ -519,7 +814,7 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
                 const Text(
-                  'Incoming Feed',
+                  '4-Tier Priority Feed',
                   style: TextStyle(
                     fontSize: 18,
                     fontWeight: FontWeight.bold,
@@ -527,7 +822,7 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
                   ),
                 ),
                 Text(
-                  '${_filteredNotifications.length} of ${_notifications.where((n) => !n.isDismissed).length} active',
+                  '$activeCount active notifications',
                   style: const TextStyle(
                     fontSize: 13,
                     color: AppColors.forestTextSecondary,
@@ -538,16 +833,29 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
             ),
             const SizedBox(height: 12),
 
-            // Filter Pills
+            // Filter Tabs (All, P1, P2, P3, P4)
             _buildFilterTabs(),
 
             const SizedBox(height: 16),
 
-            // Notifications List
-            if (_filteredNotifications.isEmpty)
-              _buildEmptyState()
-            else
-              ..._filteredNotifications.map(_buildNotificationCard),
+            // Four clearly separated sections or single filtered section
+            if (_selectedFilter == 'All') ...[
+              _buildSectionBlock(NotificationPriority.critical),
+              const SizedBox(height: 18),
+              _buildSectionBlock(NotificationPriority.high),
+              const SizedBox(height: 18),
+              _buildSectionBlock(NotificationPriority.normal),
+              const SizedBox(height: 18),
+              _buildSectionBlock(NotificationPriority.low),
+            ] else if (_selectedFilter == 'P1 Critical') ...[
+              _buildSectionBlock(NotificationPriority.critical, isExpanded: true),
+            ] else if (_selectedFilter == 'P2 High') ...[
+              _buildSectionBlock(NotificationPriority.high, isExpanded: true),
+            ] else if (_selectedFilter == 'P3 Normal') ...[
+              _buildSectionBlock(NotificationPriority.normal, isExpanded: true),
+            ] else if (_selectedFilter == 'P4 Low') ...[
+              _buildSectionBlock(NotificationPriority.low, isExpanded: true),
+            ],
 
             const SizedBox(height: 20),
 
@@ -559,7 +867,7 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
                 child: ElevatedButton.icon(
                   onPressed: _deliverAllBatched,
                   icon: const Icon(Icons.unarchive_outlined, size: 18),
-                  label: Text('Deliver Batched Items Now ($_batchedCount)'),
+                  label: Text('Deliver All Batched Items Now ($_batchedCount)'),
                   style: ElevatedButton.styleFrom(
                     backgroundColor: Colors.white,
                     foregroundColor: AppColors.sagePrimary,
@@ -577,7 +885,7 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
                 ),
               ),
 
-            // Mindful info box
+            // Mindful info guide
             _buildMindfulGuideBox(),
 
             const SizedBox(height: 28),
@@ -725,7 +1033,7 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
                     const SizedBox(height: 2),
                     Text(
                       _isPauseActive
-                          ? 'Protecting your focus & calm'
+                          ? 'Protecting your focus with 4-tier filtering'
                           : 'Standard notification delivery',
                       style: TextStyle(
                         fontSize: 13,
@@ -773,7 +1081,7 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
                 Expanded(
                   child: Text(
                     _isPauseActive
-                        ? 'Urgent alerts break through. Important & Can Wait are paused.'
+                        ? 'P1 bypasses pause. P2 delivers in ${_p2DelayMinutes}m. P3 batches. P4 holds for break.'
                         : 'All incoming notifications will buzz normally.',
                     style: TextStyle(
                       fontSize: 12.5,
@@ -826,8 +1134,7 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
                   },
                   labelStyle: TextStyle(
                     fontSize: 13,
-                    fontWeight:
-                        isSelected ? FontWeight.w600 : FontWeight.w500,
+                    fontWeight: isSelected ? FontWeight.w600 : FontWeight.w500,
                     color: isSelected
                         ? Colors.white
                         : AppColors.forestTextSecondary,
@@ -854,10 +1161,11 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
 
   Widget _buildFilterTabs() {
     final tabs = [
-      {'label': 'All', 'count': _notifications.where((n) => !n.isDismissed).length},
-      {'label': 'Urgent', 'count': _countForPriority(NotificationPriority.urgent)},
-      {'label': 'Important', 'count': _countForPriority(NotificationPriority.important)},
-      {'label': 'Can Wait', 'count': _countForPriority(NotificationPriority.canWait)},
+      {'label': 'All', 'count': _activeNotifications.length, 'color': AppColors.sagePrimary},
+      {'label': 'P1 Critical', 'count': _itemsForPriority(NotificationPriority.critical).length, 'color': NotificationPriority.critical.color},
+      {'label': 'P2 High', 'count': _itemsForPriority(NotificationPriority.high).length, 'color': NotificationPriority.high.color},
+      {'label': 'P3 Normal', 'count': _itemsForPriority(NotificationPriority.normal).length, 'color': NotificationPriority.normal.color},
+      {'label': 'P4 Low', 'count': _itemsForPriority(NotificationPriority.low).length, 'color': NotificationPriority.low.color},
     ];
 
     return SingleChildScrollView(
@@ -866,6 +1174,7 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
         children: tabs.map((tab) {
           final label = tab['label'] as String;
           final count = tab['count'] as int;
+          final color = tab['color'] as Color;
           final isSelected = _selectedFilter == label;
 
           return Padding(
@@ -879,16 +1188,13 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
               },
               child: AnimatedContainer(
                 duration: const Duration(milliseconds: 180),
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
                 decoration: BoxDecoration(
-                  color: isSelected ? AppColors.paleMintSurface : Colors.white,
+                  color: isSelected ? color.withValues(alpha: 0.12) : Colors.white,
                   borderRadius: BorderRadius.circular(20),
                   border: Border.all(
-                    color: isSelected
-                        ? AppColors.sagePrimary
-                        : AppColors.borderSage,
-                    width: isSelected ? 1.4 : 1,
+                    color: isSelected ? color : AppColors.borderSage,
+                    width: isSelected ? 1.5 : 1,
                   ),
                 ),
                 child: Row(
@@ -897,21 +1203,15 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
                       label,
                       style: TextStyle(
                         fontSize: 13,
-                        fontWeight:
-                            isSelected ? FontWeight.bold : FontWeight.w500,
-                        color: isSelected
-                            ? AppColors.sageDeep
-                            : AppColors.forestTextSecondary,
+                        fontWeight: isSelected ? FontWeight.bold : FontWeight.w500,
+                        color: isSelected ? color : AppColors.forestTextSecondary,
                       ),
                     ),
                     const SizedBox(width: 6),
                     Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 6, vertical: 2),
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                       decoration: BoxDecoration(
-                        color: isSelected
-                            ? AppColors.sagePrimary
-                            : AppColors.paleMintSurface,
+                        color: isSelected ? color : AppColors.paleMintSurface,
                         borderRadius: BorderRadius.circular(10),
                       ),
                       child: Text(
@@ -919,9 +1219,7 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
                         style: TextStyle(
                           fontSize: 11,
                           fontWeight: FontWeight.bold,
-                          color: isSelected
-                              ? Colors.white
-                              : AppColors.forestTextSecondary,
+                          color: isSelected ? Colors.white : AppColors.forestTextSecondary,
                         ),
                       ),
                     ),
@@ -935,18 +1233,15 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
     );
   }
 
-  Widget _buildNotificationCard(PauseNotificationItem item) {
-    final styling = _categoryStyle(item.priority);
+  // Four clearly separated sections on screen
+  Widget _buildSectionBlock(NotificationPriority priority, {bool isExpanded = false}) {
+    final items = _itemsForPriority(priority);
 
     return Container(
-      margin: const EdgeInsets.only(bottom: 14),
       decoration: BoxDecoration(
         color: Colors.white,
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(
-          color: styling.borderColor,
-          width: 1.2,
-        ),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: priority.borderColor, width: 1.5),
         boxShadow: const [
           BoxShadow(
             color: AppColors.shadowSage,
@@ -955,25 +1250,236 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
           ),
         ],
       ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Section Header
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: priority.bgColor,
+              borderRadius: const BorderRadius.vertical(top: Radius.circular(19)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: priority.color.withValues(alpha: 0.15),
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Icon(priority.icon, color: priority.color, size: 20),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Text(
+                                priority.label,
+                                style: TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.bold,
+                                  color: priority.color,
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                                decoration: BoxDecoration(
+                                  color: priority.color,
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                                child: Text(
+                                  '${items.length}',
+                                  style: const TextStyle(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.bold,
+                                    color: Colors.white,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            priority.description,
+                            style: const TextStyle(
+                              fontSize: 12,
+                              color: AppColors.forestTextSecondary,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    // Section-level release/override button
+                    if (items.isNotEmpty && priority != NotificationPriority.critical)
+                      TextButton.icon(
+                        onPressed: () => _deliverSection(priority),
+                        icon: const Icon(Icons.flash_on_rounded, size: 14),
+                        label: Text('Deliver ${priority.code}'),
+                        style: TextButton.styleFrom(
+                          foregroundColor: priority.color,
+                          visualDensity: VisualDensity.compact,
+                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                          textStyle: const TextStyle(
+                            fontSize: 11.5,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+                // Extra configurable delay bar specifically for P2 High
+                if (priority == NotificationPriority.high) ...[
+                  const SizedBox(height: 12),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: priority.borderColor),
+                    ),
+                    child: SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: Row(
+                        children: [
+                          const Icon(Icons.timer_outlined, size: 16, color: Color(0xFFD97706)),
+                          const SizedBox(width: 6),
+                          const Text(
+                            'P2 Delay:',
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.bold,
+                              color: Color(0xFF92400E),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          ...[3, 5, 10, 15].map((mins) {
+                            final isSelected = _p2DelayMinutes == mins;
+                            return Padding(
+                              padding: const EdgeInsets.only(right: 6),
+                              child: InkWell(
+                                borderRadius: BorderRadius.circular(8),
+                                onTap: () {
+                                  setState(() {
+                                    _p2DelayMinutes = mins;
+                                  });
+                                  _savePreferences();
+                                },
+                                child: AnimatedContainer(
+                                  duration: const Duration(milliseconds: 150),
+                                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                  decoration: BoxDecoration(
+                                    color: isSelected ? const Color(0xFFD97706) : Colors.transparent,
+                                    borderRadius: BorderRadius.circular(8),
+                                    border: Border.all(
+                                      color: isSelected ? const Color(0xFFD97706) : AppColors.borderSage,
+                                    ),
+                                  ),
+                                  child: Text(
+                                    '${mins}m',
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      fontWeight: isSelected ? FontWeight.bold : FontWeight.w500,
+                                      color: isSelected ? Colors.white : AppColors.forestTextSecondary,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            );
+                          }),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+
+          // Cards inside this section
+          Padding(
+            padding: const EdgeInsets.all(14),
+            child: items.isEmpty
+                ? _buildEmptySectionPlaceholder(priority)
+                : Column(
+                    children: items.map(_buildNotificationCard).toList(),
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildEmptySectionPlaceholder(NotificationPriority priority) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 16),
+      decoration: BoxDecoration(
+        color: AppColors.paleMintBg.withValues(alpha: 0.5),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: AppColors.borderSage.withValues(alpha: 0.5)),
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(Icons.check_circle_outline_rounded, size: 18, color: priority.color.withValues(alpha: 0.6)),
+          const SizedBox(width: 8),
+          Text(
+            'No ${priority.label} notifications',
+            style: TextStyle(
+              fontSize: 13,
+              color: AppColors.forestTextSecondary,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildNotificationCard(PauseNotificationItem item) {
+    final priority = item.priority;
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: priority.borderColor, width: 1.2),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x0A000000),
+            offset: Offset(0, 2),
+            blurRadius: 8,
+          ),
+        ],
+      ),
       child: Padding(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(14),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Top row: App icon, sender, time, category badge
+            // Top row: App Icon, Sender, Time, Native Importance Badge
             Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Container(
-                  width: 38,
-                  height: 38,
+                  width: 36,
+                  height: 36,
                   decoration: BoxDecoration(
-                    color: styling.iconBg,
+                    color: priority.bgColor,
                     borderRadius: BorderRadius.circular(10),
                   ),
-                  child: Icon(item.appIcon, color: styling.badgeText, size: 20),
+                  child: Icon(item.appIcon, color: priority.color, size: 20),
                 ),
-                const SizedBox(width: 12),
+                const SizedBox(width: 10),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -988,26 +1494,60 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
                                 fontWeight: FontWeight.bold,
                                 color: AppColors.forestTextPrimary,
                               ),
+                              maxLines: 1,
                               overflow: TextOverflow.ellipsis,
                             ),
                           ),
-                          const SizedBox(width: 6),
                           Text(
                             item.timestamp,
                             style: const TextStyle(
-                              fontSize: 12,
+                              fontSize: 11.5,
                               color: AppColors.forestTextMuted,
                             ),
                           ),
                         ],
                       ),
-                      const SizedBox(height: 2),
-                      Text(
-                        item.appName,
-                        style: const TextStyle(
-                          fontSize: 12,
-                          color: AppColors.forestTextSecondary,
-                        ),
+                      const SizedBox(height: 3),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              item.appName,
+                              style: const TextStyle(
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.w500,
+                                color: AppColors.forestTextSecondary,
+                              ),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          // Native Android importance (separate from custom priority)
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFFF1F5F9),
+                              borderRadius: BorderRadius.circular(6),
+                              border: Border.all(color: const Color(0xFFCBD5E1)),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const Icon(Icons.android_rounded, size: 10, color: Color(0xFF64748B)),
+                                const SizedBox(width: 3),
+                                Text(
+                                  'Native: ${item.nativeImportance}',
+                                  style: const TextStyle(
+                                    fontSize: 10,
+                                    fontWeight: FontWeight.bold,
+                                    color: Color(0xFF475569),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
                       ),
                     ],
                   ),
@@ -1015,107 +1555,44 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
               ],
             ),
 
-            const SizedBox(height: 12),
+            const SizedBox(height: 8),
 
-            // Badge Row
-            Row(
-              children: [
-                Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                  decoration: BoxDecoration(
-                    color: styling.badgeBg,
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: styling.badgeBorder, width: 1),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(styling.icon, size: 13, color: styling.badgeText),
-                      const SizedBox(width: 4),
-                      Text(
-                        styling.name,
-                        style: TextStyle(
-                          fontSize: 11.5,
-                          fontWeight: FontWeight.bold,
-                          color: styling.badgeText,
-                          letterSpacing: 0.2,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(width: 8),
-                if (item.isDelivered)
-                  Container(
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                    decoration: BoxDecoration(
-                      color: AppColors.importantBg,
-                      borderRadius: BorderRadius.circular(6),
-                      border: Border.all(color: AppColors.importantBorder),
-                    ),
-                    child: const Text(
-                      'Delivered',
-                      style: TextStyle(
-                        fontSize: 11,
-                        color: AppColors.importantText,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                  ),
-              ],
+            // Notification Message
+            Text(
+              item.message,
+              style: const TextStyle(
+                fontSize: 13,
+                color: AppColors.forestTextSecondary,
+                height: 1.35,
+              ),
+              maxLines: 3,
+              overflow: TextOverflow.ellipsis,
             ),
 
             const SizedBox(height: 10),
 
-            // Message Title & Body
-            Text(
-              item.title,
-              style: const TextStyle(
-                fontSize: 14.5,
-                fontWeight: FontWeight.w600,
-                color: AppColors.forestTextPrimary,
-              ),
-            ),
-            const SizedBox(height: 4),
-            Text(
-              item.message,
-              style: const TextStyle(
-                fontSize: 13.5,
-                height: 1.35,
-                color: AppColors.forestTextSecondary,
-              ),
-            ),
-
-            const SizedBox(height: 12),
-
-            // Bottom Policy pill & quick actions
+            // Policy / Delivery state banner
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
               decoration: BoxDecoration(
-                color: AppColors.paleMintBg,
+                color: priority.bgColor,
                 borderRadius: BorderRadius.circular(8),
               ),
               child: Row(
                 children: [
                   Icon(
-                    item.priority == NotificationPriority.urgent
-                        ? Icons.bolt_rounded
-                        : item.priority == NotificationPriority.important
-                            ? Icons.pause_circle_outline_rounded
-                            : Icons.bedtime_outlined,
-                    size: 14,
-                    color: styling.badgeText,
+                    item.isDelivered ? Icons.check_circle_rounded : Icons.info_outline_rounded,
+                    size: 13,
+                    color: priority.color,
                   ),
                   const SizedBox(width: 6),
                   Expanded(
                     child: Text(
-                      item.policyLabel,
+                      item.getPolicyLabel(_p2DelayMinutes),
                       style: TextStyle(
                         fontSize: 11.5,
-                        fontWeight: FontWeight.w500,
-                        color: styling.badgeText,
+                        fontWeight: FontWeight.w600,
+                        color: priority.color,
                       ),
                     ),
                   ),
@@ -1123,53 +1600,44 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
               ),
             ),
 
-            const SizedBox(height: 12),
+            const SizedBox(height: 10),
 
-            // Action row
+            // 4-Level Priority Selector (Responsive 2x2 on phones, 1x4 on wide displays)
+            _buildPrioritySelector(item),
+
+            const SizedBox(height: 8),
+
+            // Bottom Actions: Deliver Now Override and Dismiss
             Row(
-              mainAxisAlignment: MainAxisAlignment.end,
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                if (item.priority != NotificationPriority.urgent &&
-                    !item.isDelivered)
-                  TextButton.icon(
-                    onPressed: () => _deliverSingleNotification(item),
-                    icon: const Icon(Icons.arrow_forward_rounded, size: 14),
-                    label: const Text('Deliver Now'),
-                    style: TextButton.styleFrom(
-                      foregroundColor: AppColors.sagePrimary,
-                      visualDensity: VisualDensity.compact,
-                      textStyle: const TextStyle(
-                        fontSize: 12.5,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ),
-                if (item.priority == NotificationPriority.urgent)
-                  TextButton.icon(
-                    onPressed: () {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(
-                          content: Text('Calling back ${item.sender}...'),
-                          backgroundColor: AppColors.sagePrimary,
-                          behavior: SnackBarBehavior.floating,
+                if (!item.isDelivered && priority != NotificationPriority.critical)
+                  Expanded(
+                    child: Align(
+                      alignment: Alignment.centerLeft,
+                      child: TextButton.icon(
+                        onPressed: () => _deliverSingleNotification(item),
+                        icon: const Icon(Icons.flash_on_rounded, size: 14),
+                        label: const Text(
+                          'Deliver Now (Override)',
+                          overflow: TextOverflow.ellipsis,
                         ),
-                      );
-                    },
-                    icon: const Icon(Icons.check_circle_outline_rounded,
-                        size: 14),
-                    label: const Text('Acknowledge'),
-                    style: TextButton.styleFrom(
-                      foregroundColor: AppColors.urgentText,
-                      visualDensity: VisualDensity.compact,
-                      textStyle: const TextStyle(
-                        fontSize: 12.5,
-                        fontWeight: FontWeight.w600,
+                        style: TextButton.styleFrom(
+                          foregroundColor: priority.color,
+                          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+                          visualDensity: VisualDensity.compact,
+                          textStyle: const TextStyle(
+                            fontSize: 11.5,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
                       ),
                     ),
-                  ),
+                  )
+                else
+                  const Spacer(),
                 IconButton(
-                  icon: const Icon(Icons.close_rounded,
-                      size: 18, color: AppColors.forestTextMuted),
+                  icon: const Icon(Icons.close_rounded, size: 18, color: AppColors.forestTextMuted),
                   tooltip: 'Dismiss',
                   onPressed: () => _dismissNotification(item),
                   visualDensity: VisualDensity.compact,
@@ -1182,48 +1650,171 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
     );
   }
 
-  Widget _buildEmptyState() {
+  Widget _buildPrioritySelector(PauseNotificationItem item) {
     return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.symmetric(vertical: 36, horizontal: 20),
-      margin: const EdgeInsets.only(top: 8),
+      padding: const EdgeInsets.all(8),
       decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: AppColors.borderSage),
+        color: AppColors.paleMintBg,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: AppColors.borderSage.withValues(alpha: 0.6)),
       ),
       child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Container(
-            padding: const EdgeInsets.all(14),
-            decoration: const BoxDecoration(
-              color: AppColors.paleMintSurface,
-              shape: BoxShape.circle,
-            ),
-            child: const Icon(
-              Icons.check_rounded,
-              color: AppColors.sagePrimary,
-              size: 28,
-            ),
+          Row(
+            children: [
+              const Icon(
+                Icons.tune_rounded,
+                size: 13,
+                color: AppColors.forestTextSecondary,
+              ),
+              const SizedBox(width: 5),
+              const Text(
+                'Assign Level',
+                style: TextStyle(
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.bold,
+                  color: AppColors.forestTextSecondary,
+                ),
+              ),
+              const Spacer(),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: item.priority.color.withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Text(
+                  item.priority.label,
+                  style: TextStyle(
+                    fontSize: 10.5,
+                    fontWeight: FontWeight.bold,
+                    color: item.priority.color,
+                  ),
+                ),
+              ),
+            ],
           ),
-          const SizedBox(height: 12),
-          const Text(
-            'All quiet in this category',
-            style: TextStyle(
-              fontSize: 15,
-              fontWeight: FontWeight.bold,
-              color: AppColors.forestTextPrimary,
-            ),
-          ),
-          const SizedBox(height: 4),
-          const Text(
-            'Enjoy your peace of mind.',
-            style: TextStyle(
-              fontSize: 13,
-              color: AppColors.forestTextSecondary,
-            ),
+          const SizedBox(height: 6),
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final isWide = constraints.maxWidth >= 380;
+              if (isWide) {
+                return Row(
+                  children: NotificationPriority.values.map((p) {
+                    final isSelected = item.priority == p;
+                    return Expanded(
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 2),
+                        child: _buildPriorityButton(item, p, isSelected),
+                      ),
+                    );
+                  }).toList(),
+                );
+              }
+
+              return Column(
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _buildPriorityButton(
+                          item,
+                          NotificationPriority.critical,
+                          item.priority == NotificationPriority.critical,
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: _buildPriorityButton(
+                          item,
+                          NotificationPriority.high,
+                          item.priority == NotificationPriority.high,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _buildPriorityButton(
+                          item,
+                          NotificationPriority.normal,
+                          item.priority == NotificationPriority.normal,
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: _buildPriorityButton(
+                          item,
+                          NotificationPriority.low,
+                          item.priority == NotificationPriority.low,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              );
+            },
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildPriorityButton(
+    PauseNotificationItem item,
+    NotificationPriority p,
+    bool isSelected,
+  ) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(8),
+      onTap: () => _updatePriority(item, p),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 150),
+        padding: const EdgeInsets.symmetric(vertical: 7, horizontal: 4),
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: isSelected ? p.color : Colors.white,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: isSelected ? p.color : AppColors.borderSage.withValues(alpha: 0.8),
+            width: isSelected ? 1.4 : 1.0,
+          ),
+          boxShadow: isSelected
+              ? [
+                  BoxShadow(
+                    color: p.color.withValues(alpha: 0.3),
+                    blurRadius: 4,
+                    offset: const Offset(0, 1),
+                  ),
+                ]
+              : null,
+        ),
+        child: FittedBox(
+          fit: BoxFit.scaleDown,
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                p.icon,
+                size: 12,
+                color: isSelected ? Colors.white : p.color,
+              ),
+              const SizedBox(width: 4),
+              Text(
+                p.label,
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                  color: isSelected ? Colors.white : AppColors.forestTextPrimary,
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -1250,7 +1841,7 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  'How NeuroPause Triaging Works',
+                  'NeuroPause 4-Tier Priority Model',
                   style: TextStyle(
                     fontSize: 13.5,
                     fontWeight: FontWeight.bold,
@@ -1259,7 +1850,11 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
                 ),
                 SizedBox(height: 4),
                 Text(
-                  '• Urgent: Time-sensitive health, family, or critical alerts ring right away.\n• Important: Batched and delivered during your mindful breaks.\n• Can Wait: Non-urgent newsletters and updates kept for evening review.',
+                  '• P1 Critical: Time-sensitive emergencies deliver immediately with sound/vibration.\n'
+                  '• P2 High: Fast-tracked batch delivered after a short delay (3-15m).\n'
+                  '• P3 Normal: Regular batch delivered at scheduled pause breaks.\n'
+                  '• P4 Low: Non-urgent newsletters and notifications held for evening digest.\n\n'
+                  'Tap any P1/P2/P3/P4 badge on a card to instantly reassign its level and move it between sections.',
                   style: TextStyle(
                     fontSize: 12,
                     height: 1.45,
@@ -1273,59 +1868,4 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
       ),
     );
   }
-
-  _CategoryConfig _categoryStyle(NotificationPriority priority) {
-    switch (priority) {
-      case NotificationPriority.urgent:
-        return _CategoryConfig(
-          name: 'Urgent',
-          icon: Icons.error_outline_rounded,
-          badgeBg: AppColors.urgentBg,
-          badgeBorder: AppColors.urgentBorder,
-          badgeText: AppColors.urgentText,
-          iconBg: AppColors.urgentBg,
-          borderColor: const Color(0xFFF9DDD7),
-        );
-      case NotificationPriority.important:
-        return _CategoryConfig(
-          name: 'Important',
-          icon: Icons.star_rounded,
-          badgeBg: AppColors.importantBg,
-          badgeBorder: AppColors.importantBorder,
-          badgeText: AppColors.importantText,
-          iconBg: AppColors.importantBg,
-          borderColor: const Color(0xFFD4E8DC),
-        );
-      case NotificationPriority.canWait:
-        return _CategoryConfig(
-          name: 'Can Wait',
-          icon: Icons.hourglass_empty_rounded,
-          badgeBg: AppColors.canWaitBg,
-          badgeBorder: AppColors.canWaitBorder,
-          badgeText: AppColors.canWaitText,
-          iconBg: AppColors.canWaitBg,
-          borderColor: const Color(0xFFE2ECE5),
-        );
-    }
-  }
-}
-
-class _CategoryConfig {
-  final String name;
-  final IconData icon;
-  final Color badgeBg;
-  final Color badgeBorder;
-  final Color badgeText;
-  final Color iconBg;
-  final Color borderColor;
-
-  _CategoryConfig({
-    required this.name,
-    required this.icon,
-    required this.badgeBg,
-    required this.badgeBorder,
-    required this.badgeText,
-    required this.iconBg,
-    required this.borderColor,
-  });
 }

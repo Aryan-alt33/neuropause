@@ -405,23 +405,28 @@ class _HomeScreenState extends State<HomeScreen> {
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                const Row(
-                  children: [
-                    Icon(
-                      Icons.favorite_outline_rounded,
-                      color: AppColors.sagePrimary,
-                      size: 20,
-                    ),
-                    SizedBox(width: 8),
-                    Text(
-                      'Today\'s Mood Summary',
-                      style: TextStyle(
-                        fontSize: 15,
-                        fontWeight: FontWeight.bold,
-                        color: AppColors.forestTextPrimary,
+                Expanded(
+                  child: Row(
+                    children: const [
+                      Icon(
+                        Icons.favorite_outline_rounded,
+                        color: AppColors.sagePrimary,
+                        size: 20,
                       ),
-                    ),
-                  ],
+                      SizedBox(width: 8),
+                      Flexible(
+                        child: Text(
+                          'Today\'s Mood Summary',
+                          style: TextStyle(
+                            fontSize: 15,
+                            fontWeight: FontWeight.bold,
+                            color: AppColors.forestTextPrimary,
+                          ),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
                 InkWell(
                   onTap: _navigateToMoodCheck,

@@ -15,6 +15,7 @@ class NeuroNotificationListenerService : NotificationListenerService() {
 
         private val capturedNotificationsList = Collections.synchronizedList(mutableListOf<Map<String, Any>>())
         var onNotificationReceived: ((Map<String, Any>) -> Unit)? = null
+        var onNotificationRemovedCallback: ((Map<String, Any>) -> Unit)? = null
 
         fun getCapturedNotifications(): List<Map<String, Any>> {
             synchronized(capturedNotificationsList) {
@@ -57,6 +58,15 @@ class NeuroNotificationListenerService : NotificationListenerService() {
 
     override fun onNotificationRemoved(sbn: StatusBarNotification?) {
         super.onNotificationRemoved(sbn)
+        if (sbn == null) return
+        val id = sbn.key ?: "${sbn.packageName}_${sbn.id}_${sbn.postTime}"
+        onNotificationRemovedCallback?.invoke(
+            mapOf(
+                "eventType" to "removed",
+                "id" to id,
+                "packageName" to (sbn.packageName ?: "")
+            )
+        )
     }
 
     fun fetchActiveNotifications() {
@@ -101,14 +111,33 @@ class NeuroNotificationListenerService : NotificationListenerService() {
             } catch (_: Exception) {
             }
 
+            // Android native importance / priority
+            val nativePriority = notification.priority
+            val nativeImportanceLabel = when (nativePriority) {
+                Notification.PRIORITY_MAX -> "Max"
+                Notification.PRIORITY_HIGH -> "High"
+                Notification.PRIORITY_LOW -> "Low"
+                Notification.PRIORITY_MIN -> "Min"
+                else -> "Default"
+            }
+            val nativeChannelId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                notification.channelId ?: ""
+            } else {
+                ""
+            }
+
             val item = mapOf(
+                "eventType" to "posted",
                 "id" to (sbn.key ?: "${pkg}_${sbn.id}_${sbn.postTime}"),
                 "packageName" to pkg,
                 "appName" to appLabel,
                 "title" to (title ?: appLabel),
                 "message" to (text ?: subText ?: ""),
                 "postTime" to sbn.postTime,
-                "category" to (notification.category ?: "")
+                "category" to (notification.category ?: ""),
+                "nativeImportance" to nativeImportanceLabel,
+                "nativeChannelId" to nativeChannelId,
+                "isClearable" to sbn.isClearable
             )
 
             synchronized(capturedNotificationsList) {
