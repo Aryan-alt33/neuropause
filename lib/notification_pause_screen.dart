@@ -151,24 +151,44 @@ class PauseNotificationItem {
     this.isDismissed = false,
   });
 
-  String getPolicyLabel(int p2DelayMinutes) {
+  String getPolicyLabel(int p2DelayMinutes, {DateTime? pauseEndTime, bool isPauseActive = true}) {
+    if (!isPauseActive) {
+      return 'Delivered • Pause inactive';
+    }
     if (isDelivered) {
       return 'Delivered • Ready in your notifications';
     }
     switch (priority) {
       case NotificationPriority.critical:
-        return 'Allowed Through • Sound & Alert ON';
+        return 'Allowed Through • Immediate Bypass';
       case NotificationPriority.high:
-        final age = DateTime.now()
+        final ageSeconds = DateTime.now()
             .difference(DateTime.fromMillisecondsSinceEpoch(postTime))
-            .inMinutes;
-        final remaining = p2DelayMinutes - age;
-        if (remaining > 0) {
-          return 'Batched • Delivers in ${remaining}m (Short Delay)';
+            .inSeconds;
+        final remainingSeconds = (p2DelayMinutes * 60) - ageSeconds;
+        if (remainingSeconds > 60) {
+          final remMins = (remainingSeconds / 60).ceil();
+          return 'Batched • Delivers in ${remMins}m (Short Delay)';
+        } else if (remainingSeconds > 0) {
+          return 'Batched • Delivers in <1m (Short Delay)';
         } else {
           return 'Ready for delivery • Short Delay elapsed';
         }
       case NotificationPriority.normal:
+        if (pauseEndTime != null) {
+          final diff = pauseEndTime.difference(DateTime.now());
+          if (diff.inSeconds > 0) {
+            if (diff.inMinutes >= 60) {
+              final hrs = diff.inHours;
+              final remMins = diff.inMinutes % 60;
+              return 'Batched • Delivers in ${hrs}h ${remMins}m (Pause Batch)';
+            } else if (diff.inMinutes > 0) {
+              return 'Batched • Delivers in ${diff.inMinutes}m (Pause Batch)';
+            } else {
+              return 'Batched • Delivers in <1m (Pause Batch)';
+            }
+          }
+        }
         return 'Batched for Break • Scheduled Pause Release';
       case NotificationPriority.low:
         return 'Silenced • Kept for Evening / Break Review';
@@ -189,11 +209,14 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
     with WidgetsBindingObserver {
   static const String _prefPrioritiesKey = 'neuropause_priority_overrides_v2';
   static const String _prefDismissedKey = 'neuropause_dismissed_ids_v2';
+  static const String _prefDeliveredKey = 'neuropause_delivered_ids_v2';
   static const String _prefP2DelayKey = 'neuropause_p2_delay_minutes';
 
   bool _isPauseActive = true;
   String _selectedFilter = 'All';
   String _selectedDuration = '1 hour';
+  DateTime? _pauseEndTime;
+  Timer? _lifecycleTimer;
 
   int _p2DelayMinutes = 5; // Default short delay for P2 High
 
@@ -203,6 +226,7 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
 
   Map<String, String> _persistedPriorities = {};
   Set<String> _dismissedIds = {};
+  Set<String> _deliveredIds = {};
 
   List<PauseNotificationItem> _notifications = [];
   List<PauseNotificationItem> _sampleNotifications = [];
@@ -213,18 +237,107 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _pauseEndTime = _calculatePauseEndTime(_selectedDuration);
     _initSampleNotifications();
     _loadPreferences().then((_) {
       _checkPermissionAndRefresh();
     });
     _listenToLiveNotifications();
+    _lifecycleTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      _checkScheduledDeliveries();
+    });
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _liveSubscription?.cancel();
+    _lifecycleTimer?.cancel();
     super.dispose();
+  }
+
+  DateTime _calculatePauseEndTime(String duration) {
+    final now = DateTime.now();
+    switch (duration) {
+      case '15 mins':
+        return now.add(const Duration(minutes: 15));
+      case '30 mins':
+        return now.add(const Duration(minutes: 30));
+      case '1 hour':
+        return now.add(const Duration(hours: 1));
+      case '2 hours':
+        return now.add(const Duration(hours: 2));
+      case 'Until 6 PM':
+        final sixPm = DateTime(now.year, now.month, now.day, 18, 0);
+        if (now.isBefore(sixPm)) {
+          return sixPm;
+        } else {
+          return sixPm.add(const Duration(days: 1));
+        }
+      default:
+        return now.add(const Duration(hours: 1));
+    }
+  }
+
+  String _getScheduledReleaseText() {
+    if (!_isPauseActive || _pauseEndTime == null) return '';
+    final diff = _pauseEndTime!.difference(DateTime.now());
+    if (diff.isNegative || diff.inSeconds <= 0) return ' (ready for batch release)';
+    if (diff.inMinutes < 1) return ' (releases in <1m)';
+    return ' (releases in ${diff.inMinutes}m)';
+  }
+
+  void _checkScheduledDeliveries() {
+    if (!mounted) return;
+    final now = DateTime.now();
+
+    // 1. Check if scheduled pause duration has elapsed (release P2/P3 batch)
+    if (_isPauseActive && _pauseEndTime != null && now.isAfter(_pauseEndTime!)) {
+      int released = 0;
+      for (final n in _notifications) {
+        if (!n.isDismissed && !n.isDelivered &&
+            (n.priority == NotificationPriority.high || n.priority == NotificationPriority.normal)) {
+          n.isDelivered = true;
+          _deliveredIds.add(n.id);
+          released++;
+        }
+      }
+      if (released > 0) {
+        _savePreferences();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Scheduled pause batch delivered ($released notifications).'),
+            backgroundColor: AppColors.sagePrimary,
+            duration: const Duration(seconds: 3),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+      // Reset cycle for next scheduled batch interval
+      _pauseEndTime = _calculatePauseEndTime(_selectedDuration);
+    }
+
+    // 2. Check P2 High notifications: deliver if _p2DelayMinutes passed since postTime
+    bool p2Changed = false;
+    for (final n in _notifications) {
+      if (!n.isDismissed && !n.isDelivered && n.priority == NotificationPriority.high) {
+        final postDateTime = DateTime.fromMillisecondsSinceEpoch(n.postTime);
+        final elapsedSeconds = now.difference(postDateTime).inSeconds;
+        if (elapsedSeconds >= _p2DelayMinutes * 60) {
+          n.isDelivered = true;
+          _deliveredIds.add(n.id);
+          p2Changed = true;
+        }
+      }
+    }
+    if (p2Changed) {
+      _savePreferences();
+    }
+
+    // Refresh timestamps and policy status labels periodically
+    if (mounted) {
+      setState(() {});
+    }
   }
 
   @override
@@ -251,6 +364,11 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
       if (rawDismissed != null) {
         _dismissedIds = Set<String>.from(rawDismissed);
       }
+
+      final rawDelivered = prefs.getStringList(_prefDeliveredKey);
+      if (rawDelivered != null) {
+        _deliveredIds = Set<String>.from(rawDelivered);
+      }
     } catch (_) {}
   }
 
@@ -262,6 +380,8 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
           _prefPrioritiesKey, jsonEncode(_persistedPriorities));
       await prefs.setStringList(
           _prefDismissedKey, _dismissedIds.toList());
+      await prefs.setStringList(
+          _prefDeliveredKey, _deliveredIds.toList());
     } catch (_) {}
   }
 
@@ -361,7 +481,25 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
           final id = (raw['id'] as String?) ?? '';
           if (_dismissedIds.contains(id)) continue;
           final item = _mapNativeNotification(raw);
-          updated.add(item);
+          // Preserve in-memory delivered state across refreshes
+          final wasDelivered = _notifications.any((n) =>
+              (n.id == item.id ||
+                  (n.packageName == item.packageName &&
+                      n.title == item.title &&
+                      n.message == item.message)) &&
+              n.isDelivered);
+          if (wasDelivered || _deliveredIds.contains(item.id)) {
+            item.isDelivered = true;
+          }
+          // Duplicate prevention: avoid inserting duplicate items with same package, title, and message
+          final isDuplicate = updated.any((existing) =>
+              existing.id == item.id ||
+              (existing.packageName == item.packageName &&
+                  existing.title == item.title &&
+                  existing.message == item.message));
+          if (!isDuplicate) {
+            updated.add(item);
+          }
         }
         setState(() {
           _realNotifications = updated;
@@ -405,26 +543,41 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
 
       final item = _mapNativeNotification(raw);
       setState(() {
-        // Handle notification update in-place safely
-        final existingIndex = _realNotifications.indexWhere((n) => n.id == item.id);
-        if (existingIndex >= 0) {
-          final existing = _realNotifications[existingIndex];
+        // Handle notification update in-place safely with duplicate prevention
+        final existingRealIndex = _realNotifications.indexWhere((n) =>
+            n.id == item.id ||
+            (n.packageName == item.packageName &&
+                n.title == item.title &&
+                n.message == item.message));
+        if (existingRealIndex >= 0) {
+          final existing = _realNotifications[existingRealIndex];
           // Preserve manual priority, isDelivered, isDismissed
           item.priority = existing.priority;
           item.isDelivered = existing.isDelivered;
           item.isDismissed = existing.isDismissed;
-          _realNotifications[existingIndex] = item;
+          _realNotifications[existingRealIndex] = item;
         } else {
           _realNotifications.insert(0, item);
         }
 
         if (!_isDemoMode) {
-          final displayIndex = _notifications.indexWhere((n) => n.id == item.id);
+          final displayIndex = _notifications.indexWhere((n) =>
+              n.id == item.id ||
+              (n.packageName == item.packageName &&
+                  n.title == item.title &&
+                  n.message == item.message));
           if (displayIndex >= 0) {
             final existing = _notifications[displayIndex];
             item.priority = existing.priority;
-            item.isDelivered = existing.isDelivered;
             item.isDismissed = existing.isDismissed;
+            if (item.priority == NotificationPriority.critical) {
+              item.isDelivered = true;
+            } else if (existing.message == item.message &&
+                existing.postTime == item.postTime) {
+              item.isDelivered = existing.isDelivered;
+            } else {
+              item.isDelivered = !_isPauseActive;
+            }
             _notifications[displayIndex] = item;
           } else {
             _notifications.insert(0, item);
@@ -452,8 +605,7 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
     // Check if user manually assigned priority previously for this stable ID or sender
     NotificationPriority priority;
     final savedCode = _persistedPriorities[id] ??
-        _persistedPriorities['$pkg:$senderName'] ??
-        _persistedPriorities[pkg];
+        _persistedPriorities['$pkg:$senderName'];
 
     if (savedCode != null) {
       priority = NotificationPriority.values.firstWhere(
@@ -495,8 +647,10 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
       timeStr = '${diff.inDays}d ago';
     }
 
-    // Critical notifications bypass batching immediately
-    final isDelivered = priority == NotificationPriority.critical;
+    // Critical notifications bypass batching immediately, delivered IDs stay delivered
+    final isDelivered = priority == NotificationPriority.critical ||
+        _deliveredIds.contains(id) ||
+        !_isPauseActive;
 
     return PauseNotificationItem(
       id: id,
@@ -521,18 +675,27 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
         combined.contains('otp') ||
         combined.contains('verification') ||
         combined.contains('security alert') ||
+        combined.contains('hospital') ||
+        combined.contains('doctor') ||
         combined.contains('code:')) {
       return NotificationPriority.critical; // P1
     } else if (pkg.contains('whatsapp') ||
         pkg.contains('slack') ||
         pkg.contains('teams') ||
         pkg.contains('telegram') ||
-        pkg.contains('messaging')) {
+        pkg.contains('messaging') ||
+        combined.contains('chat') ||
+        combined.contains('message') ||
+        combined.contains('whatsapp')) {
       return NotificationPriority.high; // P2 (communication)
     } else if (pkg.contains('gm') ||
         pkg.contains('mail') ||
         pkg.contains('discord') ||
-        pkg.contains('work')) {
+        pkg.contains('work') ||
+        combined.contains('mail') ||
+        combined.contains('digest') ||
+        combined.contains('newsletter') ||
+        combined.contains('sprint')) {
       return NotificationPriority.normal; // P3 (work/mail batch)
     } else {
       return NotificationPriority.low; // P4 (digest/can wait)
@@ -578,7 +741,9 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
   void _deliverSingleNotification(PauseNotificationItem item) {
     setState(() {
       item.isDelivered = true;
+      _deliveredIds.add(item.id);
     });
+    _savePreferences();
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text('Delivered "${item.title}" immediately.'),
@@ -596,10 +761,12 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
       for (final n in _notifications) {
         if (!n.isDismissed && n.priority == priority && !n.isDelivered) {
           n.isDelivered = true;
+          _deliveredIds.add(n.id);
           count++;
         }
       }
     });
+    _savePreferences();
 
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
@@ -617,10 +784,12 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
       for (final n in _notifications) {
         if (!n.isDismissed && !n.isDelivered && n.priority != NotificationPriority.critical) {
           n.isDelivered = true;
+          _deliveredIds.add(n.id);
           count++;
         }
       }
     });
+    _savePreferences();
 
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
@@ -1054,6 +1223,16 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
                 onChanged: (val) {
                   setState(() {
                     _isPauseActive = val;
+                    if (val) {
+                      _pauseEndTime = _calculatePauseEndTime(_selectedDuration);
+                    } else {
+                      // Turning pause OFF releases all batched items immediately
+                      for (final n in _notifications) {
+                        if (!n.isDismissed && !n.isDelivered) {
+                          n.isDelivered = true;
+                        }
+                      }
+                    }
                   });
                 },
               ),
@@ -1081,8 +1260,8 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
                 Expanded(
                   child: Text(
                     _isPauseActive
-                        ? 'P1 bypasses pause. P2 delivers in ${_p2DelayMinutes}m. P3 batches. P4 holds for break.'
-                        : 'All incoming notifications will buzz normally.',
+                        ? 'P1 bypasses pause. P2 delivers in ${_p2DelayMinutes}m. P3 batches${_getScheduledReleaseText()}. P4 holds for break.'
+                        : 'Pause is Off. All notifications deliver immediately.',
                     style: TextStyle(
                       fontSize: 12.5,
                       fontWeight: FontWeight.w500,
@@ -1101,7 +1280,7 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
   }
 
   Widget _buildDurationSelector() {
-    final durations = ['30 mins', '1 hour', '2 hours', 'Until 6 PM'];
+    final durations = ['15 mins', '30 mins', '1 hour', '2 hours', 'Until 6 PM'];
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -1129,6 +1308,7 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
                     if (selected) {
                       setState(() {
                         _selectedDuration = d;
+                        _pauseEndTime = _calculatePauseEndTime(d);
                       });
                     }
                   },
@@ -1318,7 +1498,7 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
                       ),
                     ),
                     // Section-level release/override button
-                    if (items.isNotEmpty && priority != NotificationPriority.critical)
+                    if (items.any((i) => !i.isDelivered) && priority != NotificationPriority.critical)
                       TextButton.icon(
                         onPressed: () => _deliverSection(priority),
                         icon: const Icon(Icons.flash_on_rounded, size: 14),
@@ -1369,6 +1549,7 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
                                 onTap: () {
                                   setState(() {
                                     _p2DelayMinutes = mins;
+                                    _checkScheduledDeliveries();
                                   });
                                   _savePreferences();
                                 },
@@ -1588,7 +1769,11 @@ class _NotificationPauseScreenState extends State<NotificationPauseScreen>
                   const SizedBox(width: 6),
                   Expanded(
                     child: Text(
-                      item.getPolicyLabel(_p2DelayMinutes),
+                      item.getPolicyLabel(
+                        _p2DelayMinutes,
+                        pauseEndTime: _pauseEndTime,
+                        isPauseActive: _isPauseActive,
+                      ),
                       style: TextStyle(
                         fontSize: 11.5,
                         fontWeight: FontWeight.w600,

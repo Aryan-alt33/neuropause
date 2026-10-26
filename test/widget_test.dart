@@ -33,7 +33,7 @@ void main() {
 
     expect(find.byType(NotificationPauseScreen), findsOneWidget);
     expect(find.text('Pause is Active'), findsOneWidget);
-    expect(find.text('Incoming Feed'), findsOneWidget);
+    expect(find.text('4-Tier Priority Feed'), findsOneWidget);
 
     // Back to Home Screen
     final backButton = find.byTooltip('Back');
