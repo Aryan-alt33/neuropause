@@ -1,0 +1,21 @@
+{
+"project": "NeuroPause",
+"description": "Example data for testing digital wellbeing features. All entries are fictional.",
+"mood_check_ins": [
+{
+"date": "2026-10-25",
+"mood": "Calm",
+"reflection": "Took a short breathing break and felt more focused."
+},
+{
+"date": "2026-10-26",
+"mood": "Okay",
+"reflection": "A short break helped me reset during a busy day."
+}
+],
+"wellbeing_tips": [
+"Take a short screen break between focused work sessions.",
+"Silence nonessential alerts when you need uninterrupted time.",
+"Pause and take a few slow breaths when you feel overwhelmed."
+]
+}
