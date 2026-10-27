@@ -105,7 +105,8 @@ These results describe the checks performed during development. Additional devic
 
 📊 Sample Data
 
-The application may use user-generated mood entries and wellbeing reflections. Add sample data or test fixtures here if they are used by the project. Do not include real users' private information in sample files.
+The "test/sample_data.json" file contains sample data for testing and demonstrating NeuroPause's wellbeing features. The data is fictional and does not contain real users' private information.
+
 
 🔐 Permissions and Privacy
 
